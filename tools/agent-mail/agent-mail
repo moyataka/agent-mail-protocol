@@ -1,0 +1,490 @@
+#!/usr/bin/env python3
+"""Store agent messages locally and deliver short notices through native Herdr."""
+
+import argparse
+from contextlib import closing
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from enum import Enum
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import sqlite3
+import subprocess
+import sys
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS message (
+    id INTEGER PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    from_team TEXT NOT NULL,
+    from_session TEXT NOT NULL,
+    from_agent TEXT NOT NULL,
+    from_terminal TEXT NOT NULL,
+    project TEXT,
+    task TEXT,
+    kind TEXT,
+    subject TEXT NOT NULL,
+    body TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('read', 'ack')),
+    reply_to INTEGER REFERENCES message(id)
+);
+CREATE TABLE IF NOT EXISTS recipient (
+    message_id INTEGER NOT NULL REFERENCES message(id),
+    to_team TEXT NOT NULL,
+    to_session TEXT NOT NULL,
+    to_agent TEXT NOT NULL,
+    notification TEXT NOT NULL DEFAULT 'pending'
+        CHECK (notification IN ('pending', 'rejected', 'uncertain', 'submitted')),
+    notification_error TEXT,
+    attempted_at TEXT,
+    submitted_at TEXT,
+    acknowledged_at TEXT,
+    PRIMARY KEY (message_id, to_session, to_agent)
+);
+CREATE INDEX IF NOT EXISTS recipient_inbox
+    ON recipient (to_session, to_agent, acknowledged_at, message_id);
+"""
+
+
+class MailError(Exception):
+    pass
+
+
+class HerdrError(MailError):
+    def __init__(self, code):
+        self.code = code
+        super().__init__(f"Herdr: {code}")
+
+
+class NoticeAction(str, Enum):
+    READ = "read"
+    ACK = "ack"
+
+
+@dataclass(frozen=True)
+class Address:
+    session: str
+    name: str
+
+
+@dataclass(frozen=True)
+class Recipient:
+    team: str
+    address: Address
+
+
+@dataclass(frozen=True)
+class Sender:
+    address: Address
+    terminal: str
+
+
+def timestamp():
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def label(value):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value):
+        raise argparse.ArgumentTypeError("expected a name using letters, digits, or ._-")
+    return value
+
+
+def recipient_address(value):
+    parts = value.split("/")
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError("expected TEAM/SESSION/AGENT")
+    team, session, name = map(label, parts)
+    return Recipient(team, Address(session, name))
+
+
+def message_id(value):
+    if not re.fullmatch(r"M[1-9][0-9]{0,18}", value) or int(value[1:]) > 2**63 - 1:
+        raise argparse.ArgumentTypeError("expected a message ID such as M42")
+    return int(value[1:])
+
+
+def subject_line(value):
+    if not value.strip() or not value.isprintable() or len(value) > 120:
+        raise argparse.ArgumentTypeError("subject must be one printable line of at most 120 characters")
+    return value.strip()
+
+
+def positive_limit(value):
+    try:
+        limit = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("limit must be a positive integer") from None
+    if not 1 <= limit <= 2**63 - 1:
+        raise argparse.ArgumentTypeError("limit must be a positive SQLite integer")
+    return limit
+
+
+def herdr(*arguments):
+    try:
+        result = subprocess.run(
+            ["herdr", *arguments], capture_output=True, text=True, timeout=10, check=False
+        )
+    except subprocess.TimeoutExpired:
+        raise HerdrError("timeout") from None
+    except OSError:
+        raise HerdrError("unavailable") from None
+    if result.returncode:
+        for stream in (result.stderr, result.stdout):
+            try:
+                error = json.loads(stream).get("error", {})
+                code = error.get("code")
+                if isinstance(code, str) and re.fullmatch(r"[a-zA-Z0-9_-]+", code):
+                    raise HerdrError(code)
+            except (ValueError, AttributeError):
+                continue
+        raise HerdrError("command_failed")
+    try:
+        result_json = json.loads(result.stdout)
+        if not isinstance(result_json, dict) or result_json.get("error"):
+            raise ValueError
+        return result_json
+    except ValueError:
+        raise HerdrError("invalid_response") from None
+
+
+def live_agent(session, target):
+    reply = herdr("--session", session, "agent", "get", target)
+    agent = reply.get("result", {}).get("agent", {})
+    if not all(agent.get(field) for field in ("name", "pane_id", "terminal_id")):
+        raise MailError("Herdr target must be a live, named agent")
+    if target not in (agent["name"], agent["pane_id"]):
+        raise MailError("Herdr returned a different agent")
+    return agent
+
+
+def caller():
+    pane = os.environ.get("HERDR_PANE_ID")
+    socket = os.environ.get("HERDR_SOCKET_PATH")
+    if os.environ.get("HERDR_ENV") != "1" or not pane or not socket:
+        raise MailError("run this command in a named Herdr agent pane")
+    sessions = herdr("session", "list", "--json").get("sessions", [])
+    current_socket = Path(socket).resolve()
+    for session in sessions:
+        if session.get("running") and Path(session["socket_path"]).resolve() == current_socket:
+            name = session["name"]
+            agent = live_agent(name, pane)
+            return Sender(Address(name, agent["name"]), agent["terminal_id"])
+    raise MailError("the caller's Herdr socket did not match a running session")
+
+
+def database_path():
+    organization = Path(__file__).resolve().parents[2]
+    return organization / "organization-state" / "agent-mail" / "mailbox.sqlite3"
+
+
+def open_database(path):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    database = sqlite3.connect(path, timeout=10)
+    try:
+        database.row_factory = sqlite3.Row
+        database.execute("PRAGMA foreign_keys = ON")
+        database.executescript(SCHEMA)
+    except Exception:
+        database.close()
+        raise
+    return database
+
+
+def message_body(args):
+    if args.action is NoticeAction.ACK:
+        if args.from_file or args.body is not None:
+            raise MailError("an ack notice stores its subject as the complete message")
+        return args.subject
+    if args.from_file:
+        body = args.from_file.read_bytes().decode("utf-8")
+    else:
+        body = args.body
+    if not body or not body.strip():
+        raise MailError("a read notice requires --body or --from-file")
+    return body
+
+
+def store_message(database, args, sender, body):
+    with database:
+        cursor = database.execute(
+            """INSERT INTO message
+                (created_at, from_team, from_session, from_agent, from_terminal,
+                 project, task, kind, subject, body, action, reply_to)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (timestamp(), args.from_team, sender.address.session, sender.address.name,
+             sender.terminal, args.project, args.task, args.kind, args.subject, body,
+             args.action.value, args.reply_to),
+        )
+        identifier = cursor.lastrowid
+        database.executemany(
+            """INSERT INTO recipient (message_id, to_team, to_session, to_agent)
+               VALUES (?, ?, ?, ?)""",
+            ((identifier, target.team, target.address.session, target.address.name)
+             for target in args.to),
+        )
+    return identifier
+
+
+def notice_text(identifier, action, subject):
+    return f"MAIL M{identifier} {action} | {subject}"
+
+
+def send_notice(database, identifier, recipient, notice):
+    key = (identifier, recipient["to_session"], recipient["to_agent"])
+    try:
+        live_agent(*key[1:])
+    except MailError as error:
+        with database:
+            database.execute(
+                """UPDATE recipient
+                   SET notification = 'rejected', attempted_at = ?, notification_error = ?
+                   WHERE message_id = ? AND to_session = ? AND to_agent = ?""",
+                (timestamp(), str(error), *key),
+            )
+        return
+    with database:
+        reservation = database.execute(
+            """UPDATE recipient
+               SET notification = 'uncertain', attempted_at = ?, notification_error = NULL
+               WHERE message_id = ? AND to_session = ? AND to_agent = ?
+                 AND acknowledged_at IS NULL""",
+            (timestamp(), *key),
+        )
+    if not reservation.rowcount:
+        return
+    try:
+        reply = herdr("--session", key[1], "agent", "prompt", key[2], notice)
+        if "result" not in reply:
+            raise HerdrError("invalid_response")
+        result = "submitted"
+        failure = None
+    except HerdrError as error:
+        result = "rejected" if error.code == "agent_blocked" else "uncertain"
+        failure = error.code
+    with database:
+        database.execute(
+            """UPDATE recipient SET notification = ?, submitted_at = ?, notification_error = ?
+               WHERE message_id = ? AND to_session = ? AND to_agent = ?""",
+            (result, timestamp() if result == "submitted" else None, failure, *key),
+        )
+
+
+def notify(database, path, identifier, sender, retry_uncertain=False):
+    message = database.execute(
+        """SELECT action, subject FROM message
+           WHERE id = ? AND from_session = ? AND from_agent = ?""",
+        (identifier, sender.address.session, sender.address.name),
+    ).fetchone()
+    if message is None:
+        raise MailError(f"M{identifier} is unavailable to this sender")
+    notice = notice_text(identifier, message["action"], message["subject"])
+    # A process exit releases the lock. An interrupted submission stays uncertain.
+    with path.with_suffix(".notify.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        recipients = delivery_rows(database, identifier)
+        for recipient in recipients:
+            state = recipient["notification"]
+            if recipient["acknowledged_at"] or state == "submitted":
+                continue
+            if state == "uncertain" and not retry_uncertain:
+                continue
+            send_notice(database, identifier, recipient, notice)
+        return status(database, identifier)
+
+
+def send(database, path, args, sender):
+    body = message_body(args)
+    if len({target.address for target in args.to}) != len(args.to):
+        raise MailError("list each recipient address once")
+    if args.reply_to and not database.execute(
+        "SELECT 1 FROM message WHERE id = ?", (args.reply_to,)
+    ).fetchone():
+        raise MailError(f"reply target M{args.reply_to} does not exist")
+    identifier = store_message(database, args, sender, body)
+    return notify(database, path, identifier, sender)
+
+
+def delivery_rows(database, identifier):
+    return database.execute(
+        """SELECT to_team, to_session, to_agent, notification, notification_error, attempted_at,
+                  submitted_at, acknowledged_at
+           FROM recipient WHERE message_id = ? ORDER BY to_team, to_session, to_agent""",
+        (identifier,),
+    ).fetchall()
+
+
+def receipt(row):
+    return "acknowledged" if row["acknowledged_at"] else row["notification"]
+
+
+def status(database, identifier):
+    rows = database.execute(
+        "SELECT notification, acknowledged_at FROM recipient WHERE message_id = ?", (identifier,)
+    ).fetchall()
+    if not rows:
+        raise MailError(f"M{identifier} does not exist")
+    states = [receipt(row) for row in rows]
+    counts = " ".join(f"{state}={states.count(state)}" for state in sorted(set(states)))
+    print(f"M{identifier} {counts}")
+    return int(any(state in ("pending", "rejected", "uncertain") for state in states))
+
+
+def inbox(database, sender, limit):
+    rows = database.execute(
+        """SELECT message.id, message.action, message.subject
+           FROM message JOIN recipient ON message.id = recipient.message_id
+           WHERE to_session = ? AND to_agent = ? AND acknowledged_at IS NULL
+           ORDER BY message.id LIMIT ?""",
+        (sender.address.session, sender.address.name, limit),
+    )
+    for row in rows:
+        print(notice_text(row["id"], row["action"], row["subject"]))
+
+
+def read_message(database, identifier, sender):
+    row = database.execute(
+        """SELECT message.body FROM message JOIN recipient ON message.id = recipient.message_id
+           WHERE message.id = ? AND to_session = ? AND to_agent = ?""",
+        (identifier, sender.address.session, sender.address.name),
+    ).fetchone()
+    if row is None:
+        raise MailError(f"M{identifier} is unavailable to this recipient")
+    sys.stdout.write(row["body"])
+
+
+def acknowledge(database, identifier, sender):
+    with database:
+        update = database.execute(
+            """UPDATE recipient SET acknowledged_at = COALESCE(acknowledged_at, ?)
+               WHERE message_id = ? AND to_session = ? AND to_agent = ?""",
+            (timestamp(), identifier, sender.address.session, sender.address.name),
+        )
+        if not update.rowcount:
+            raise MailError(f"M{identifier} is unavailable to this recipient")
+    print(f"M{identifier} acknowledged")
+
+
+def history(database, args):
+    filters = (
+        (args.team, "(from_team = ? OR to_team = ?)"),
+        (args.from_team, "from_team = ?"),
+        (args.to_team, "to_team = ?"),
+        (args.project, "project = ?"),
+        (args.task, "task = ?"),
+        (args.sender, "from_agent = ?"),
+        (args.recipient, "to_agent = ?"),
+        (args.kind, "kind = ?"),
+    )
+    clauses = [clause for value, clause in filters if value is not None]
+    bindings = [value for value, clause in filters if value is not None for _ in range(clause.count("?"))]
+    where = "WHERE " + " AND ".join(clauses) if clauses else ""
+    rows = database.execute(
+        f"""SELECT message.id, created_at, from_team, from_agent, project, task,
+                   kind, subject, to_team, to_agent, notification, acknowledged_at
+            FROM message JOIN recipient ON message.id = recipient.message_id
+            {where} ORDER BY message.id DESC, to_team, to_agent LIMIT ?""",
+        (*bindings, args.limit),
+    )
+    report = [("TIME", "ID", "FROM TEAM", "FROM", "TO TEAM", "TO",
+               "PROJECT", "TASK", "KIND", "RECEIPT", "SUBJECT")]
+    for row in rows:
+        local_time = datetime.fromisoformat(row["created_at"]).astimezone()
+        report.append((
+            local_time.strftime("%Y-%m-%d %H:%M:%S %Z"), f"M{row['id']}", row["from_team"],
+            row["from_agent"], row["to_team"], row["to_agent"], row["project"] or "-",
+            row["task"] or "-", row["kind"] or "-", receipt(row), row["subject"],
+        ))
+    widths = [max(map(len, values)) for values in zip(*report)]
+    for row in report:
+        print("  ".join(value.ljust(width) for value, width in zip(row, widths)).rstrip())
+
+
+def show(database, identifier):
+    message = database.execute("SELECT * FROM message WHERE id = ?", (identifier,)).fetchone()
+    if message is None:
+        raise MailError(f"M{identifier} does not exist")
+    record = dict(message)
+    record["id"] = f"M{identifier}"
+    if record["reply_to"]:
+        record["reply_to"] = f"M{record['reply_to']}"
+    record["replies"] = [
+        f"M{row['id']}" for row in database.execute(
+            "SELECT id FROM message WHERE reply_to = ? ORDER BY id", (identifier,)
+        )
+    ]
+    record["recipients"] = [
+        {**dict(row), "receipt": receipt(row)} for row in delivery_rows(database, identifier)
+    ]
+    body = record.pop("body")
+    print(json.dumps(record, indent=2, ensure_ascii=False))
+    print()
+    sys.stdout.write(body)
+
+
+def arguments():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    compose = commands.add_parser("send", help="store one message and submit its notice")
+    compose.add_argument("--from-team", required=True, type=label)
+    compose.add_argument("--to", required=True, action="append", type=recipient_address, metavar="TEAM/SESSION/AGENT")
+    for option in ("project", "task", "kind"):
+        compose.add_argument(f"--{option}", type=label if option != "task" else subject_line)
+    compose.add_argument("--subject", required=True, type=subject_line)
+    compose.add_argument("--action", choices=["read", "ack"], default="read")
+    compose.add_argument("--reply-to", type=message_id)
+    source = compose.add_mutually_exclusive_group()
+    source.add_argument("--body")
+    source.add_argument("--from-file", type=Path)
+
+    retry = commands.add_parser("notify", help="submit a pending or failed notice by ID")
+    retry.add_argument("id", type=message_id)
+    retry.add_argument("--retry-uncertain", action="store_true", help="allow re-notifying after checking receipt")
+    for command in ("read", "ack", "show", "status"):
+        commands.add_parser(command).add_argument("id", type=message_id)
+    commands.add_parser("inbox").add_argument("--limit", type=positive_limit, default=30)
+    report = commands.add_parser("history", help="display tracking details for a human")
+    for option in ("team", "from-team", "to-team", "project", "task", "kind"):
+        report.add_argument(f"--{option}")
+    report.add_argument("--from", dest="sender")
+    report.add_argument("--to", dest="recipient")
+    report.add_argument("--limit", type=positive_limit, default=50)
+    return parser.parse_args()
+
+
+def main():
+    args = arguments()
+    os.umask(0o077)
+    path = database_path()
+    try:
+        if args.command in ("send", "notify", "inbox", "read", "ack"):
+            sender = caller()
+        with closing(open_database(path)) as database:
+            if args.command == "send":
+                args.action = NoticeAction(args.action)
+                return send(database, path, args, sender)
+            if args.command == "notify":
+                return notify(database, path, args.id, sender, args.retry_uncertain)
+            if args.command == "inbox":
+                inbox(database, sender, args.limit)
+            elif args.command == "read":
+                read_message(database, args.id, sender)
+            elif args.command == "ack":
+                acknowledge(database, args.id, sender)
+            elif args.command == "history":
+                history(database, args)
+            elif args.command == "show":
+                show(database, args.id)
+            elif args.command == "status":
+                return status(database, args.id)
+    except (MailError, OSError, UnicodeError, sqlite3.Error) as error:
+        print(f"agent-mail: {error}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
